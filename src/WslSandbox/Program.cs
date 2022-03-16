@@ -1,12 +1,13 @@
-﻿using System;
-using System.IO;
+﻿using SharpCompress.Compressors.Xz;
+using System;
 using System.Diagnostics;
+using System.IO;
 using System.Net.Http;
-using System.Threading.Tasks;
-using System.Threading;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace WslSandbox
 {
@@ -42,7 +43,8 @@ namespace WslSandbox
             var tempDistroName = ng.GetRandomName();
             var wslPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "wsl.exe");
 
-            var tarGzFilePath = default(string);
+            var downloadedFilePath = default(string);
+            var processedFilePath = default(string);
 
             try
             {
@@ -59,16 +61,37 @@ namespace WslSandbox
                 if (!Directory.Exists(downloadDirectoryPath))
                     Directory.CreateDirectory(downloadDirectoryPath);
 
-                tarGzFilePath = Path.Combine(downloadDirectoryPath, $"{tempDistroName}.tar.gz");
                 var data = await OpenRootFilesystemStream(rootFs, cts.Token);
 
                 if (ReferenceEquals(data.Item2, Stream.Null))
                     throw new Exception("Cannot load target root file system image.");
 
+                var extension = ".dat";
+                switch (data.Item3)
+                {
+                    case RootFsContentType.Tar:
+                        extension = ".tar";
+                        break;
+
+                    case RootFsContentType.TarGz:
+                        extension = ".tar.gz";
+                        break;
+
+                    case RootFsContentType.TarXz:
+                        extension = ".tar.xz";
+                        break;
+
+                    default:
+                        extension = ".dat";
+                        break;
+                }
+
+                downloadedFilePath = Path.Combine(downloadDirectoryPath, $"{tempDistroName}.{extension.TrimStart('.')}");
+
                 await Console.Out.WriteLineAsync("Downloading distribution tarball archive...");
 
                 using (var contentStream = data.Item2)
-                using (var fileStream = File.OpenWrite(tarGzFilePath))
+                using (var fileStream = File.OpenWrite(downloadedFilePath))
                 using (var progress = new ProgressBar())
                 {
                     progress.Report(0d);
@@ -91,6 +114,30 @@ namespace WslSandbox
                     progress.Report(1d);
                 }
 
+                await Console.Out.WriteLineAsync("Processing distribution tarball conversion...");
+
+                if (data.Item3 == RootFsContentType.TarGz)
+                    processedFilePath = downloadedFilePath;
+                else if (data.Item3 == RootFsContentType.Tar)
+                    processedFilePath = downloadedFilePath;
+                else if (data.Item3 == RootFsContentType.TarXz)
+                {
+                    // Decompress tar.xz file to .tar file
+                    processedFilePath = Path.Combine(downloadDirectoryPath, $"{tempDistroName}.tar");
+
+                    using (var contentStream = File.OpenRead(downloadedFilePath))
+                    using (var xzStream = new XZStream(contentStream))
+                    using (var fileStream = File.OpenWrite(processedFilePath))
+                    {
+                        await xzStream.CopyToAsync(fileStream, 64000, cts.Token);
+                    }
+
+                    if (File.Exists(downloadedFilePath))
+                        File.Delete(downloadedFilePath);
+                }
+                else
+                    throw new Exception("Cannot load root file system image due to unsupported format.");
+
                 var distroInstallPath = Path.Combine(basePath, tempDistroName);
 
                 await Console.Out.WriteLineAsync($"Install temporary distro '{tempDistroName}' on '{distroInstallPath}' (Version: {setVersion}).");
@@ -102,17 +149,18 @@ namespace WslSandbox
                     Directory.CreateDirectory(distroInstallPath);
 
                 var psi = new ProcessStartInfo(wslPath,
-                    $"--import {tempDistroName} \"{distroInstallPath}\" \"{tarGzFilePath}\" --version {setVersion}")
+                    $"--import {tempDistroName} \"{distroInstallPath}\" \"{processedFilePath}\" --version {setVersion}")
                 {
                     UseShellExecute = false,
                 };
 
                 var process = Process.Start(psi);
 
-                if (process == null)
-                    throw new Exception("Cannot register the temporary distro.");
+                if (process != null)
+                    await WaitForExitAsync(process, cts.Token);
 
-                await WaitForExitAsync(process, cts.Token);
+                if (process == null || process.ExitCode != 0)
+                    throw new Exception("Cannot register the temporary distro.");
 
                 psi = new ProcessStartInfo(wslPath,
                     $"--distribution {tempDistroName} -- {string.Join(" ", args)}")
@@ -122,10 +170,11 @@ namespace WslSandbox
 
                 process = Process.Start(psi);
 
-                if (process == null)
-                    throw new Exception("Cannot launch the temporary distro.");
+                if (process != null)
+                    await WaitForExitAsync(process, cts.Token);
 
-                await WaitForExitAsync(process, cts.Token);
+                if (process == null || process.ExitCode != 0)
+                    throw new Exception("Cannot launch the temporary distro.");
 
                 return 0;
             }
@@ -142,10 +191,16 @@ namespace WslSandbox
             }
             finally
             {
-                if (!string.IsNullOrWhiteSpace(tarGzFilePath) &&
-                    File.Exists(tarGzFilePath))
+                if (!string.IsNullOrWhiteSpace(downloadedFilePath) &&
+                    File.Exists(downloadedFilePath))
                 {
-                    File.Delete(tarGzFilePath);
+                    File.Delete(downloadedFilePath);
+                }
+
+                if (!string.IsNullOrWhiteSpace(processedFilePath) &&
+                    File.Exists(processedFilePath))
+                {
+                    File.Delete(processedFilePath);
                 }
 
                 var psi = new ProcessStartInfo(wslPath,
@@ -182,8 +237,10 @@ namespace WslSandbox
             return ex;
         }
 
-        private static async Task<Tuple<long?, Stream>> OpenRootFilesystemStream(string rootFs, CancellationToken cancellationToken = default)
+        private static async Task<Tuple<long?, Stream, RootFsContentType>> OpenRootFilesystemStream(string rootFs, CancellationToken cancellationToken = default)
         {
+            var contentType = default(RootFsContentType);
+
             if (string.IsNullOrWhiteSpace(rootFs))
                 rootFs = "alpine-315";
 
@@ -191,27 +248,30 @@ namespace WslSandbox
             {
                 case "alpine-315":
                     rootFs = "https://dl-cdn.alpinelinux.org/alpine/v3.15/releases/x86_64/alpine-minirootfs-3.15.0-x86_64.tar.gz";
+                    contentType = RootFsContentType.TarGz;
                     break;
 
                 case "ubuntu-1804":
                     rootFs = "https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64-wsl.rootfs.tar.gz";
+                    contentType = RootFsContentType.TarGz;
                     break;
 
                 case "ubuntu-2004":
                     rootFs = "https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64-wsl.rootfs.tar.gz";
+                    contentType = RootFsContentType.TarGz;
                     break;
 
                 default:
-                    return new Tuple<long?, Stream>(null, Stream.Null);
+                    return new Tuple<long?, Stream, RootFsContentType>(null, Stream.Null, contentType);
             }
 
             if (!Uri.TryCreate(rootFs, UriKind.Absolute, out var parsedUri))
-                return new Tuple<long?, Stream>(null, Stream.Null);
+                return new Tuple<long?, Stream, RootFsContentType>(null, Stream.Null, contentType);
 
             if (parsedUri.IsFile)
             {
                 var fileInfo = new FileInfo(parsedUri.LocalPath);
-                return new Tuple<long?, Stream>(fileInfo.Length, fileInfo.OpenRead());
+                return new Tuple<long?, Stream, RootFsContentType>(fileInfo.Length, fileInfo.OpenRead(), contentType);
             }
 
             if (string.Equals(Uri.UriSchemeHttps, parsedUri.Scheme, StringComparison.Ordinal) ||
@@ -227,14 +287,15 @@ namespace WslSandbox
                 var response = await httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
 
                 if (!response.IsSuccessStatusCode)
-                    return new Tuple<long?, Stream>(null, Stream.Null);
+                    return new Tuple<long?, Stream, RootFsContentType>(null, Stream.Null, contentType);
 
-                return new Tuple<long?, Stream>(
+                return new Tuple<long?, Stream, RootFsContentType>(
                     response.Content.Headers.ContentLength,
-                    await response.Content.ReadAsStreamAsync().ConfigureAwait(false));
+                    await response.Content.ReadAsStreamAsync().ConfigureAwait(false),
+                    contentType);
             }
 
-            return new Tuple<long?, Stream>(null, Stream.Null);
+            return new Tuple<long?, Stream, RootFsContentType>(null, Stream.Null, contentType);
         }
 
         private static Task WaitForExitAsync(Process process, CancellationToken cancellationToken = default(CancellationToken))
