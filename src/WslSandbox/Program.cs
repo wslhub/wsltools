@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Threading;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
+using System.Text;
 
 namespace WslSandbox
 {
@@ -37,7 +38,8 @@ namespace WslSandbox
                 finally { e.Cancel = true; }
             };
 
-            var tempDistroName = "temp_" + Guid.NewGuid().ToString("n");
+            var ng = new NamesGenerator();
+            var tempDistroName = ng.GetRandomName();
             var wslPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "wsl.exe");
 
             var tarGzFilePath = default(string);
